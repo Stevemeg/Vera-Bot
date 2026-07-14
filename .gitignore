@@ -5,3 +5,4 @@ __pycache__/
 .venv-win/
 __pycache__/
 .pytest_cache/
+dataset/
