@@ -1,0 +1,14 @@
+name: Keep Render instance warm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping healthz endpoint
+        run: |
+          curl -sf https://vera-bot-xbfu.onrender.com/v1/healthz || echo "Ping failed (instance may have been cold-starting)"
