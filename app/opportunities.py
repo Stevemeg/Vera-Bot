@@ -135,7 +135,80 @@ def _parse_dt(iso: Optional[str]) -> Optional[datetime]:
 
 
 def _family_for(kind: str) -> str:
-    return KIND_FAMILY.get(kind, "generic_signal")
+    if kind in KIND_FAMILY:
+        return KIND_FAMILY[kind]
+    return _infer_family_from_kind_name(kind)
+
+
+# Substring -> family inference for UNSEEN kinds the judge may inject after
+# submission. Ordered most-specific-first; the first substring found in the
+# kind name wins. Fully deterministic (a plain ordered scan), and only ever
+# consulted when a kind isn't in the explicit KIND_FAMILY table above — so
+# it never changes behavior for known kinds. This is the "improve trigger-
+# kind dispatch coverage" ask: a future 'vaccine_recall_due' should reach
+# the customer_recall builder, not the bare generic fallback.
+_FAMILY_KEYWORD_RULES: tuple[tuple[str, str], ...] = (
+    ("regulation", "compliance"),
+    ("compliance", "compliance"),
+    ("verify", "compliance"),
+    ("unverified", "compliance"),
+    ("license", "compliance"),
+    ("recall", "customer_recall"),
+    ("refill", "customer_recall"),
+    ("followup", "customer_recall"),
+    ("follow_up", "customer_recall"),
+    ("appointment", "appointment_reminder"),
+    ("booking", "appointment_reminder"),
+    ("lapsed", "winback"),
+    ("winback", "winback"),
+    ("win_back", "winback"),
+    ("churn", "winback"),
+    ("dormant", "reengagement"),
+    ("inactive", "reengagement"),
+    ("competitor", "competitive"),
+    ("rival", "competitive"),
+    ("review", "reputation"),
+    ("rating", "reputation"),
+    ("reputation", "reputation"),
+    ("renewal", "subscription"),
+    ("subscription", "subscription"),
+    ("billing", "subscription"),
+    ("dip", "performance_negative"),
+    ("drop", "performance_negative"),
+    ("decline", "performance_negative"),
+    ("spike", "performance_positive"),
+    ("milestone", "performance_positive"),
+    ("growth", "performance_positive"),
+    ("intent", "intent"),
+    ("planning", "intent"),
+    ("supply", "operational"),
+    ("inventory", "operational"),
+    ("stock", "operational"),
+    ("festival", "seasonal"),
+    ("seasonal", "seasonal"),
+    ("weather", "seasonal"),
+    ("match", "seasonal"),
+    ("event", "seasonal"),
+    ("holiday", "seasonal"),
+    ("research", "knowledge"),
+    ("digest", "knowledge"),
+    ("cde", "knowledge"),
+    ("study", "knowledge"),
+    ("trend", "knowledge"),
+    ("curious", "engagement_cadence"),
+    ("ask", "engagement_cadence"),
+)
+
+
+def _infer_family_from_kind_name(kind: str) -> str:
+    """Best-effort deterministic family guess for an unseen kind, by
+    scanning its name for known substrings. Falls back to generic_signal
+    only when nothing matches."""
+    name = str(kind).lower()
+    for needle, family in _FAMILY_KEYWORD_RULES:
+        if needle in name:
+            return family
+    return "generic_signal"
 
 
 def fatigue_penalty(merchant: Optional[dict]) -> tuple[float, str]:

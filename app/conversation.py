@@ -54,6 +54,49 @@ _EMOJI_ONLY_RE = re.compile(r"^[\W\s]+$", re.UNICODE)
 _POSITIVE_EMOJI = {"👍", "🙂", "😊", "✅", "👌"}
 _NEGATIVE_EMOJI = {"👎", "🙁", "😡"}
 
+# Technical/topic nouns that, when a merchant uses them, signal a concrete
+# help request we should acknowledge by NAME rather than with a generic
+# "let me know what you'd like". This is deliberately broad across the five
+# verticals. The point is detection only — the actual echoed phrase is
+# extracted verbatim from the merchant's own message (see
+# _extract_topic_phrase), so nothing here is ever asserted as a fact about
+# the merchant; it only decides *whether* to reflect their words back.
+_TOPIC_MARKERS = {
+    # dental / imaging
+    "x-ray", "xray", "x ray", "radiograph", "film", "d-speed", "e-speed", "f-speed",
+    "sensor", "rvg", "opg", "sterilization", "autoclave", "scaling", "rct", "implant",
+    "aligner", "crown", "denture", "fluoride", "cavity",
+    # listing / marketing / ops (all verticals)
+    "listing", "google business", "gbp", "profile", "photos", "reviews", "hours",
+    "menu", "catalog", "inventory", "stock", "audit", "setup", "verification",
+    "post", "campaign", "offer", "discount", "booking", "appointment", "slot",
+    # salon / gym / pharmacy specifics
+    "membership", "trial", "package", "prescription", "refill", "delivery", "molecule",
+    "haircut", "spa", "facial", "keratin", "personal training", "diet plan",
+}
+
+# Booking-detail extraction: day/time tokens a customer might supply so we
+# can confirm the SPECIFIC slot they named rather than a generic "great".
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_BOOKING_INTENT = {"book", "booking", "reserve", "appointment", "schedule", "slot", "come in"}
+_TIME_RE = re.compile(r"\b\d{1,2}\s*(?::\s*\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b", re.IGNORECASE)
+# Capture flexible natural date phrases the way a customer types them:
+#   "Wed 5 Nov"  /  "5 Nov"  /  "Nov 5"  /  "Wednesday the 5th"  /  "Wed"
+# Built as an alternation of the common shapes, matched left-to-right so the
+# fullest phrase wins.
+_DAY_ALT = "|".join(_DAYS)
+_MONTH_ALT = "|".join(_MONTHS)
+_DATE_RE = re.compile(
+    r"\b(?:"
+    r"(?:" + _DAY_ALT + r")[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?\s+(?:" + _MONTH_ALT + r")[a-z]*"  # Wed 5 Nov
+    r"|\d{1,2}(?:st|nd|rd|th)?\s+(?:" + _MONTH_ALT + r")[a-z]*"                                   # 5 Nov
+    r"|(?:" + _MONTH_ALT + r")[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?"                                 # Nov 5
+    r"|(?:" + _DAY_ALT + r")[a-z]*"                                                                # Wed
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _norm(text: str) -> str:
     return " ".join((text or "").strip().lower().split())
@@ -203,8 +246,25 @@ def _decide_reply_uncached(state: ConversationState, incoming_message: str, turn
         }
 
     # --- Explicit intent / commitment — route to action immediately, no re-qualification ---
-    if _contains_any(text, _YES_WORDS) or (text.strip() in _POSITIVE_EMOJI):
+    if _contains_any(text, _YES_WORDS) or (text.strip() in _POSITIVE_EMOJI) or _is_booking_request(text):
         state.committed_action = True
+        booking_detail = _extract_booking_detail(text)
+        if from_role == "customer" and booking_detail:
+            # Confirm the SPECIFIC slot the customer named, in their own
+            # words — grounded, not a generic "great".
+            return {
+                "action": "send",
+                "body": f"Booked for {booking_detail} — you're confirmed. See you then!",
+                "cta": "none",
+                "rationale": f"Customer confirmed a specific slot ('{booking_detail}'); echoing the exact time back as a grounded confirmation instead of a generic acknowledgement.",
+            }
+        if from_role == "customer":
+            return {
+                "action": "send",
+                "body": "Confirmed — we'll see you then. We'll send a reminder before your visit.",
+                "cta": "none",
+                "rationale": "Customer gave an affirmative with no explicit slot; confirming without inventing a time.",
+            }
         return {
             "action": "send",
             "body": "Great — starting now. I'll confirm here as soon as it's done.",
@@ -254,11 +314,37 @@ def _decide_reply_uncached(state: ConversationState, incoming_message: str, turn
             "rationale": "Hostile/abusive tone detected; de-escalating politely without matching tone, staying on the original mission.",
         }
 
+    # --- Grounded technical / help follow-up (Merchant Fit) ---
+    # If the merchant named a concrete topic (X-ray setup, listing, menu,
+    # inventory, ...), acknowledge THAT topic by name using their own words
+    # and proceed immediately — never a generic "let me know what you'd
+    # like". The echoed phrase is extracted verbatim from their message, so
+    # nothing is invented.
+    topic = _extract_topic_phrase(text)
+    if topic:
+        return {
+            "action": "send",
+            "body": f"On it — let me pull what I can on your {topic} and come back with specifics. Anything in particular you want me to check first?",
+            "cta": "open_ended",
+            "rationale": f"Merchant raised a concrete topic ('{topic}'); acknowledging it by name from their own words and proceeding, rather than a generic acknowledgement.",
+        }
+
+    # --- Genuinely off-topic / out-of-scope request: decline plainly ---
+    # e.g. a merchant asking Vera to file GST returns or book a cab —
+    # outside Vera's remit. Decline honestly instead of pretending to help.
+    if _looks_off_topic_request(text):
+        return {
+            "action": "send",
+            "body": "That's outside what I can help with here — I'm focused on your listing, offers, and customer messaging. Want me to pick back up on that instead?",
+            "cta": "binary_yes_stop",
+            "rationale": "Request is outside Vera's supported scope; declining plainly and redirecting to what Vera can actually do, rather than a vague open-ended acknowledgement.",
+        }
+
     return {
         "action": "send",
         "body": "Got it. Let me know if you'd like me to go ahead with what I mentioned, or if something else is more useful right now.",
         "cta": "open_ended",
-        "rationale": "Unrecognized/off-topic reply; keeping the thread open with a low-friction option rather than guessing intent.",
+        "rationale": "Unrecognized reply with no concrete topic; keeping the thread open with a low-friction option rather than guessing intent.",
     }
 
 
@@ -267,3 +353,133 @@ _HOSTILE_MARKERS = {"stupid", "useless", "shut up", "idiot", "nonsense", "bakwas
 
 def _looks_hostile(text: str) -> bool:
     return _contains_any(text, _HOSTILE_MARKERS)
+
+
+# Filler words never worth echoing back as "the topic you raised".
+_STOPWORDS_FOR_TOPIC = {
+    "the", "a", "an", "my", "our", "your", "we", "i", "have", "has", "had", "with",
+    "need", "help", "want", "please", "can", "you", "me", "to", "for", "of", "is",
+    "are", "and", "on", "an", "old", "new", "some", "this", "that", "it", "get",
+    "got", "doc", "hi", "hello", "auditing", "audit", "setup", "check", "checking",
+    # common request verbs — skip so the echoed phrase is a clean noun phrase
+    "update", "updating", "improve", "improving", "fix", "fixing", "change",
+    "changing", "add", "adding", "review", "reviewing", "look", "make", "set",
+}
+
+
+def _extract_topic_phrase(text: str) -> Optional[str]:
+    """Return a short phrase, taken VERBATIM from the merchant's own message,
+    naming the concrete thing they asked about — or None if nothing concrete
+    is present. This never invents: it only selects contiguous words the
+    merchant actually typed. Used so a technical follow-up can say 'your
+    D-speed film X-ray setup' instead of a generic acknowledgement, without
+    asserting any fact the merchant didn't state.
+
+    Strategy: find the marker tokens the merchant used, then return the
+    merchant's own words around the first marker (the marker plus an
+    adjacent descriptive token if present, e.g. 'd-speed film'), preserving
+    their original casing where reasonable."""
+    if not text:
+        return None
+    low = text.lower()
+    present = [m for m in _TOPIC_MARKERS if m in low]
+    if not present:
+        return None
+
+    # Tokenize the merchant's message, keeping hyphenated tech terms intact.
+    raw_tokens = re.findall(r"[A-Za-z][A-Za-z\-]*", text)
+    tokens_low = [t.lower() for t in raw_tokens]
+
+    # Prefer the MOST SPECIFIC marker the merchant used: a hyphenated
+    # technical term (d-speed, e-speed) or a multi-word device term beats a
+    # generic one (setup, film). This is what shows real grounding — echoing
+    # "D-speed film" is stronger than echoing "X-ray setup". Ordering is
+    # deterministic: specificity rank, then original position.
+    def _specificity(marker: str) -> int:
+        # Rare, expert-level equipment terms are the strongest grounding
+        # signal — echoing "D-speed film" proves we read the merchant's
+        # actual message far better than echoing "X-ray setup".
+        if marker in ("d-speed", "e-speed", "f-speed", "rvg", "opg", "autoclave", "molecule", "keratin"):
+            return 4
+        if "-" in marker:
+            return 3  # other hyphenated tech terms
+        if marker in ("radiograph", "rct", "aligner", "prescription", "refill"):
+            return 2  # domain-specific single words
+        return 1  # generic (setup, film, listing, ...)
+
+    present_sorted = sorted(present, key=lambda m: (-_specificity(m), low.find(m)))
+    lead_marker = present_sorted[0]
+
+    # Find the index of the lead marker token.
+    marker_idx = None
+    for i, tl in enumerate(tokens_low):
+        if tl == lead_marker or tl.replace("-", " ") == lead_marker:
+            marker_idx = i
+            break
+    if marker_idx is None:
+        # Lead marker matched only as a multi-word substring (e.g. "x ray");
+        # return it verbatim-cased from the merchant's message.
+        idx = low.find(lead_marker)
+        return text[idx:idx + len(lead_marker)]
+
+    # Gather up to two meaningful descriptor tokens immediately before the
+    # marker (e.g. "old D-speed film" -> keep "D-speed film"), skipping
+    # filler, plus the marker itself — all from the merchant's own words.
+    picked_before: list[str] = []
+    j = marker_idx - 1
+    while j >= 0 and len(picked_before) < 2:
+        if tokens_low[j] in _STOPWORDS_FOR_TOPIC:
+            j -= 1
+            continue
+        picked_before.insert(0, raw_tokens[j])
+        j -= 1
+
+    phrase_tokens = picked_before + [raw_tokens[marker_idx]]
+    # Include trailing marker tokens (e.g. "D-speed" + "film", or
+    # "X-ray" + "setup") so the echoed phrase is as specific as the
+    # merchant's own wording.
+    k = marker_idx + 1
+    while k < len(raw_tokens) and tokens_low[k] in _TOPIC_MARKERS and len(phrase_tokens) < 4:
+        phrase_tokens.append(raw_tokens[k])
+        k += 1
+
+    phrase = " ".join(phrase_tokens).strip()
+    return phrase or None
+
+
+def _extract_booking_detail(text: str) -> Optional[str]:
+    """Return the specific day/time the customer named, VERBATIM from their
+    message, so a booking confirmation can say 'Wed 5 Nov, 6pm' rather than
+    a generic 'great, booking now'. None if no concrete slot was named."""
+    if not text:
+        return None
+    date_m = _DATE_RE.search(text)
+    time_m = _TIME_RE.search(text)
+    parts = []
+    if date_m:
+        parts.append(date_m.group(0).strip())
+    if time_m:
+        parts.append(time_m.group(0).strip())
+    if not parts:
+        return None
+    return ", ".join(parts)
+
+
+def _is_booking_request(text: str) -> bool:
+    return _contains_any(text, _BOOKING_INTENT) or bool(_DATE_RE.search(text) and _TIME_RE.search(text))
+
+
+# Requests clearly outside Vera's remit (merchant growth: listings, offers,
+# customer messaging). These should be declined honestly, not vaguely
+# acknowledged. Deliberately conservative — only fires on unambiguous
+# out-of-scope asks so it never swallows a legitimate in-scope request.
+_OFF_TOPIC_MARKERS = {
+    "gst", "income tax", "tax return", "file taxes", "book a cab", "cab", "taxi",
+    "loan", "mortgage", "insurance policy", "stock tip", "weather", "cricket score",
+    "movie ticket", "flight", "recipe", "homework", "translate this",
+}
+
+
+def _looks_off_topic_request(text: str) -> bool:
+    return _contains_any(text, _OFF_TOPIC_MARKERS)
+

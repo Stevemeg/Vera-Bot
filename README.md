@@ -1,4 +1,4 @@
-# Vera Message Engine 
+# Vera Message Engine — Challenge Submission
 
 A deterministic, layered message-composition engine for the magicpin AI
 Challenge. **There is no LLM call anywhere in the decision or
@@ -258,7 +258,7 @@ command:
 ```
 `render.yaml` in this repo already specifies the Docker build, health
 check path (`/v1/healthz`), and the persistence env var. Render assigns
-`https://vera-bot-xbfu.onrender.com/` automatically.
+`https://vera-bot-<hash>.onrender.com` automatically.
 
 **Fly.io** (free tier, automatic HTTPS):
 ```

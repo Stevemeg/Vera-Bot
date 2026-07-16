@@ -58,7 +58,7 @@ def test_unknown_future_trigger_kind_falls_back_to_generic_family(dentists_categ
     future_trigger = {
         "id": "trg_future_999",
         "scope": "merchant",
-        "kind": "quantum_offer_singularity",  # deliberately unseen kind
+        "kind": "quantum_offer_singularity",  # deliberately unseen kind, no inferable keyword
         "source": "external",
         "merchant_id": drmeera["merchant_id"],
         "customer_id": None,
@@ -70,6 +70,17 @@ def test_unknown_future_trigger_kind_falls_back_to_generic_family(dentists_categ
     op = evaluate_trigger(future_trigger, dentists_category, drmeera, None, "2026-04-26T10:00:00Z", suppressed=False)
     assert op.eligible
     assert op.family == "generic_signal"
+
+
+def test_unseen_kind_with_inferable_keyword_reaches_specific_family():
+    from app.opportunities import _family_for
+    # Future kinds the judge might inject should route by name, not dump to generic.
+    assert _family_for("vaccine_recall_due") == "customer_recall"
+    assert _family_for("gst_regulation_update") == "compliance"
+    assert _family_for("new_competitor_nearby") == "competitive"
+    assert _family_for("membership_renewal_soon") == "subscription"
+    assert _family_for("google_review_dip") == "reputation"  # review beats dip
+    assert _family_for("something_with_no_known_keyword") == "generic_signal"
 
 
 def test_ranking_is_deterministic_for_identical_inputs(dentists_category, drmeera, triggers):

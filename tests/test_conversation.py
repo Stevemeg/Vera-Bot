@@ -89,6 +89,43 @@ def test_positive_emoji_reads_as_affirmative():
     assert result["action"] == "send"
 
 
+def test_merchant_technical_followup_is_grounded_in_their_own_words():
+    store = _store()
+    st = store.get_or_create("c1", "m1", None)
+    result = decide_reply(st, "Got it doc - need help auditing my X-ray setup. We have an old D-speed film unit.", 1, "merchant")
+    assert result["action"] == "send"
+    # Must acknowledge the actual technical topic by name (from their words),
+    # not a generic "let me know what you'd like".
+    assert "D-speed" in result["body"] or "X-ray" in result["body"]
+    assert "let me know if you'd like me to go ahead with what i mentioned" not in result["body"].lower()
+
+
+def test_customer_booking_confirms_the_specific_slot():
+    store = _store()
+    st = store.get_or_create("c1", "m1", "cust1")
+    result = decide_reply(st, "Yes please book me for Wed 5 Nov, 6pm.", 1, "customer")
+    assert result["action"] == "send"
+    # Must echo the exact slot the customer named, not a generic "great".
+    assert "Wed 5 Nov" in result["body"]
+    assert "6pm" in result["body"]
+
+
+def test_off_topic_out_of_scope_request_is_declined_plainly():
+    store = _store()
+    st = store.get_or_create("c1", "m1", None)
+    result = decide_reply(st, "can you help me file my GST returns", 1, "merchant")
+    assert result["action"] == "send"
+    assert "outside" in result["body"].lower()  # honest decline, not a vague acknowledgement
+
+
+def test_stop_still_ends_immediately_after_routing_changes():
+    store = _store()
+    st = store.get_or_create("c1", "m1", None)
+    result = decide_reply(st, "stop", 1, "merchant")
+    assert result["action"] == "end"
+    assert st.opted_out is True
+
+
 def test_negative_emoji_reads_as_disengagement():
     store = _store()
     st = store.get_or_create("c1", "m1", None)

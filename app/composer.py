@@ -25,6 +25,13 @@ from typing import Optional
 from . import facts
 from .opportunities import Opportunity
 
+# Hard cap on a composed message body. The judge enforces a 320-char limit;
+# we assemble structurally to fit it (dropping the lowest-priority *optional*
+# grounded clause) rather than blind-truncating mid-word, so a shortened
+# message is still a complete, grounded sentence.
+MAX_BODY_CHARS = 320
+REQUIRED = 1_000_000  # sentinel priority for clauses that must never be dropped
+
 
 @dataclass
 class ComposedMessage:
@@ -34,55 +41,30 @@ class ComposedMessage:
     rationale: str
 
 
-_KIND_SUBJECTS = {
-    "research_digest": "a new research item",
-    "cde_opportunity": "a CDE opportunity",
-    "category_trend_movement": "a category trend",
-    "regulation_change": "a regulatory update",
-    "gbp_unverified": "Google Business Profile verification",
-    "recall_due": "a recall reminder",
-    "chronic_refill_due": "a refill reminder",
-    "curious_ask_due": "this week's customer question",
-    "customer_lapsed_hard": "a lapsed-customer winback",
-    "winback_eligible": "a lapsed-customer winback",
-    "trial_followup": "a trial follow-up",
-    "wedding_package_followup": "a package follow-up",
-    "appointment_tomorrow": "tomorrow's appointment reminder",
-    "customer_lapsed_soft": "a soft winback",
-    "perf_dip": "a performance dip",
-    "seasonal_perf_dip": "a seasonal performance dip",
-    "perf_spike": "a performance spike",
-    "milestone_reached": "a milestone",
-    "review_theme_emerged": "a review theme",
-    "competitor_opened": "a new nearby competitor",
-    "dormant_with_vera": "a dormant Vera thread",
-    "renewal_due": "subscription renewal",
-    "supply_alert": "a supply alert",
-    "festival_upcoming": "an upcoming festival window",
-    "category_seasonal": "a seasonal category window",
-    "ipl_match_today": "today's IPL window",
-    "active_planning_intent": "the planning request",
-    "weather_heatwave": "a heatwave window",
-    "local_news_event": "a local footfall event",
-}
+def _assemble_within_budget(clauses: list[tuple], max_chars: int = MAX_BODY_CHARS) -> str:
+    """Assemble a message from ordered `clauses`, each a (text, priority)
+    pair. `priority` is an int: higher = more important. Clauses are kept in
+    their given reading order; when the joined result exceeds `max_chars`,
+    the LOWEST-priority clause is dropped (ties broken by later position),
+    and we retry — so the message stays in natural reading order, stays a
+    set of complete grounded fragments (never truncated mid-clause), and
+    sheds only as much as needed to fit.
 
-
-def _humanize(value: object) -> Optional[str]:
-    if value is None or isinstance(value, bool):
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    text = text.replace("_", " ").replace("-", " ")
-    return " ".join(text.split())
-
-
-def _category_name(category: dict) -> str:
-    return facts.dig(category, "display_name") or _humanize(category.get("slug")) or "your category"
-
-
-def _kind_subject(trigger: dict) -> str:
-    return _KIND_SUBJECTS.get(str(trigger.get("kind") or ""), _humanize(trigger.get("kind")) or "this update")
+    A priority of `REQUIRED` marks a clause that must never be dropped (the
+    lead fact and the single CTA). If required clauses alone still exceed the
+    budget, they're returned as-is: we never drop a required grounded fact or
+    truncate one to hit a character count."""
+    kept = [(text, prio) for (text, prio) in clauses if text]
+    while True:
+        candidate = " ".join(t for (t, _p) in kept).strip()
+        if len(candidate) <= max_chars:
+            return candidate
+        # Find the lowest-priority droppable clause (highest index wins ties).
+        droppable = [(i, p) for i, (_t, p) in enumerate(kept) if p != REQUIRED]
+        if not droppable:
+            return candidate  # only required clauses remain; return as-is
+        drop_i = min(droppable, key=lambda ip: (ip[1], -ip[0]))[0]
+        kept.pop(drop_i)
 
 
 def _real_topic(trigger: dict, *keys: str) -> Optional[str]:
@@ -98,18 +80,8 @@ def _real_topic(trigger: dict, *keys: str) -> Optional[str]:
     for k in keys:
         v = payload.get(k)
         if v and v != kind:
-            return _humanize(v)
+            return v
     return None
-
-
-def _safe_topic(trigger: dict, *keys: str) -> str:
-    """Grounded subject for sparse generated triggers.
-
-    Placeholder payload values are not concrete facts, but trigger kind is
-    still an input fact. Using a kind-level subject avoids generic copy
-    without inventing numbers, dates, offer names, or outcomes.
-    """
-    return _real_topic(trigger, *keys) or _kind_subject(trigger)
 
 
 def _greeting(category: dict, merchant: dict, customer: Optional[dict]) -> str:
@@ -133,44 +105,32 @@ def _knowledge(category, merchant, trigger, opp: Opportunity) -> str:
         trial_n = item.get("trial_n")
         summary = item.get("summary")
         actionable = item.get("actionable")
-        segment_bits = []
-        if trial_n:
-            segment_bits.append(f"{facts.fmt_num(trial_n)}-patient trial" if item.get("kind") == "research" else None)
-        anchor = ", ".join([b for b in segment_bits if b])
         cohort = facts.has_signal(merchant, "high_risk_adult_cohort")
-        lead = f"{greet}, {title}." if title else f"{greet}, a new item just dropped for your category."
-        parts = [lead]
-        if anchor:
-            parts.append(f"{anchor.capitalize()}.")
-        if summary and item.get("kind") == "research":
-            parts.append(summary if not cohort else f"Likely relevant to your high-risk adult patients — {summary[0].lower()}{summary[1:]}")
-        elif summary:
-            parts.append(summary)
         ask = actionable or "Want me to pull the full item and draft something you can share?"
-        parts.append(ask)
-        if source:
-            parts.append(f"— {source}")
-        return " ".join(parts)
+
+        # Title and the quantified finding overlap (the title is the
+        # headline; the summary restates it WITH the numbers). Under budget
+        # pressure the number-bearing finding is more valuable than the
+        # headline, so rank it higher. The greeting is the only required
+        # lead; the CTA is the only other required clause.
+        title_clause = f"{title}." if title else None
+        anchor_clause = None
+        if trial_n and item.get("kind") == "research":
+            anchor_clause = f"{facts.fmt_num(trial_n)}-patient trial."
+        cohort_preamble = "Likely relevant to your high-risk adult patients." if (cohort and summary and item.get("kind") == "research") else None
+        finding_clause = summary if summary else None
+
+        return _assemble_within_budget([
+            (f"{greet},", REQUIRED),
+            (title_clause, 30),
+            (cohort_preamble, 25),
+            (finding_clause, 50),
+            (anchor_clause, 20),
+            (ask, REQUIRED),
+            (f"— {source}" if source else None, 10),
+        ])
     # No resolvable digest item — fall back to trend signal if present.
-    kind = trigger.get("kind")
-    cat_name = _category_name(category)
-    trends = facts.dig(category, "trend_signals", default=[]) or []
-    trend_note = None
-    for trend in trends:
-        if isinstance(trend, dict):
-            trend_note = trend.get("note") or trend.get("title") or trend.get("topic")
-        elif isinstance(trend, str):
-            trend_note = trend
-        if trend_note:
-            break
-    if kind == "cde_opportunity":
-        return f"{greet}, there's a CDE opportunity relevant to {cat_name}. Want me to pull the timing and draft a short note you can act on?"
-    if kind == "category_trend_movement":
-        if trend_note:
-            return f"{greet}, category trend to watch: {_humanize(trend_note)}. Want me to turn it into a practical next step?"
-        return f"{greet}, there's a {cat_name} trend worth acting on this week. Want the practical takeaway?"
-    subject = _safe_topic(trigger, "topic", "metric_or_topic", "title")
-    return f"{greet}, {subject} is worth a quick look for {cat_name}. Want the practical takeaway?"
+    return f"{greet}, there's a category trend worth a look this week. Want the details?"
 
 
 def _compliance(category, merchant, trigger, opp: Opportunity) -> str:
@@ -182,15 +142,19 @@ def _compliance(category, merchant, trigger, opp: Opportunity) -> str:
         title = item.get("title")
         summary = item.get("summary")
         actionable = item.get("actionable")
-        parts = [f"{greet}, heads up — {title}." if title else f"{greet}, a compliance update just landed."]
-        if summary:
-            parts.append(summary)
-        if actionable:
-            parts.append(actionable + ".")
-        if deadline:
-            parts.append(f"Deadline: {deadline}.")
-        parts.append("Want me to check your current setup against this?")
-        return " ".join(parts)
+        lead = f"{greet}, heads up — {title}." if title else f"{greet}, a compliance update just landed."
+        deadline_clause = f"Deadline: {deadline}." if deadline else None
+        actionable_clause = (actionable + ".") if actionable else None
+        # lead + CTA required; summary highest-value optional, then the
+        # actionable step, then the deadline restatement (the deadline often
+        # already appears inside the summary/actionable, so it drops first).
+        return _assemble_within_budget([
+            (lead, REQUIRED),
+            (summary, 50),
+            (actionable_clause, 40),
+            (deadline_clause, 20),
+            ("Want me to check your current setup against this?", REQUIRED),
+        ])
     if trigger.get("kind") == "gbp_unverified":
         return f"{greet}, your Google Business Profile is still unverified — this caps how much Vera can update automatically. Want the 2-minute verification steps?"
     return f"{greet}, there's a regulatory update relevant to your category. Want the details?"
@@ -326,9 +290,7 @@ def _performance_negative(category, merchant, trigger, opp: Opportunity) -> str:
     if ctr is not None and peer_ctr is not None and ctr < peer_ctr:
         bits.append(f"your CTR ({facts.fmt_pct(ctr)}) is below the category median ({facts.fmt_pct(peer_ctr)})")
     if not bits:
-        subject = _safe_topic(trigger, "metric_or_topic", "metric", "topic")
-        cat_name = _category_name(category)
-        return f"{greet}, {subject} is showing up for your {cat_name} listing. Want me to check the likely cause and one fix?"
+        return f"{greet}, your account shows a performance dip this week. Want me to pull the specifics?"
     signal_text = "; ".join(bits)
     return f"{greet}, quick flag: {signal_text}. Want me to show what's driving it and one fix to try this week?"
 
@@ -375,8 +337,8 @@ def _reengagement(category, merchant, trigger, opp: Opportunity) -> str:
             return f"{greet}, aapka last Google post {stale_days} pehle gaya tha. 2-minute mein ek naya draft kar doon?"
         return f"{greet}, your last Google post went out {stale_days} ago. Want me to draft a fresh one — 2 minutes, your review before it's live?"
     if use_hindi:
-        return f"{greet}, kuch din se Vera par activity kam hai. Is hafte ek quick update draft kar doon?"
-    return f"{greet}, Vera has been quiet for a bit. Want me to draft one useful update for this week?"
+        return f"{greet}, kuch din se baat nahi hui — sab theek chal raha hai? Kuch help chahiye toh batayein."
+    return f"{greet}, it's been a bit since we last talked — everything running fine on your end? Happy to help with anything."
 
 
 def _subscription(category, merchant, trigger, opp: Opportunity) -> str:
@@ -489,7 +451,7 @@ def _intent(category, merchant, trigger, opp: Opportunity) -> str:
 
 def _generic(category, merchant, trigger, opp: Opportunity) -> str:
     greet = _greeting(category, merchant, None)
-    topic = _safe_topic(trigger, "metric_or_topic", "topic", "title")
+    topic = _real_topic(trigger, "metric_or_topic")
     if topic:
         return f"{greet}, flagging {str(topic).replace('_', ' ')} on your account. Want the details?"
     return f"{greet}, there's a new item on your account worth a look. Want details?"
@@ -530,10 +492,31 @@ def safe_fallback(category: dict, merchant: dict, trigger: dict, opp) -> Compose
     return ComposedMessage(body=body, cta="open_ended", send_as=send_as, rationale=rationale)
 
 
+def _enforce_budget_at_sentence_boundary(body: str, max_chars: int = MAX_BODY_CHARS) -> str:
+    """Last-resort guarantee: if a builder somehow returns a body over the
+    char budget (e.g. a future builder that doesn't use
+    _assemble_within_budget), trim it back to the last COMPLETE sentence
+    that fits, never mid-word. Builders that already assemble within budget
+    are unaffected. This is a structural safety net, not the primary
+    mechanism — the primary mechanism is clause-level assembly."""
+    if len(body) <= max_chars:
+        return body
+    # Prefer trimming at a sentence boundary (., !, ?) at or before the cap.
+    cut = body[:max_chars]
+    for sep in (". ", "! ", "? "):
+        idx = cut.rfind(sep)
+        if idx > 0:
+            return cut[: idx + 1].strip()
+    # No sentence boundary found — fall back to the last whole word.
+    idx = cut.rfind(" ")
+    return (cut[:idx] if idx > 0 else cut).strip()
+
+
 def compose(category: dict, merchant: dict, trigger: dict, customer: Optional[dict], opp: Opportunity) -> ComposedMessage:
     builder = _BUILDERS.get(opp.family, lambda cat, m, t, c, o: _generic(cat, m, t, o))
     body = builder(category, merchant, trigger, customer, opp)
     body = facts.strip_taboo(body, category)
+    body = _enforce_budget_at_sentence_boundary(body)
 
     scope = trigger.get("scope", "merchant")
     send_as = "merchant_on_behalf" if scope == "customer" else "vera"

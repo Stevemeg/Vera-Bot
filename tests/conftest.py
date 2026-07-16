@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-DATASET_DIR = Path(__file__).resolve().parent.parent / "dataset"
+DATASET_DIR = Path(__file__).parent.parent.parent / "dataset"
 if not DATASET_DIR.exists():
     # fallback if the submission dir is copied without the sibling dataset
     DATASET_DIR = Path(__file__).parent / "fixtures"

@@ -9,9 +9,6 @@ from __future__ import annotations
 
 import json
 import threading
-from pathlib import Path
-
-DATASET = Path(__file__).resolve().parent.parent / "dataset"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -93,14 +90,14 @@ def test_identical_retry_does_not_count_toward_auto_reply_detection(client):
 
 def test_genuine_repeated_body_from_distinct_decisions_is_still_caught(client):
     r1 = client.post("/v1/reply", json={"conversation_id": "conv_genuine_repeat", "merchant_id": "m_gr",
-                                          "customer_id": None, "from_role": "merchant", "message": "what's the weather",
+                                          "customer_id": None, "from_role": "merchant", "message": "hmm what do you mean",
                                           "received_at": "2026-04-26T10:00:00Z", "turn_number": 1})
     assert r1.json()["action"] == "send"
     r2 = client.post("/v1/reply", json={"conversation_id": "conv_genuine_repeat", "merchant_id": "m_gr",
-                                          "customer_id": None, "from_role": "merchant", "message": "how's your day",
+                                          "customer_id": None, "from_role": "merchant", "message": "i dont understand you",
                                           "received_at": "2026-04-26T10:05:00Z", "turn_number": 2})
-    # A genuinely different message that happens to land on the same
-    # generic fallback text must still trip anti-repetition.
+    # Two genuinely different unclassifiable messages that both land on the
+    # same generic fallback text must still trip anti-repetition.
     assert r2.json()["action"] == "end"
 
 
@@ -116,13 +113,9 @@ def test_suppression_expiry_uses_simulated_now_not_real_clock():
 
 
 def test_duplicate_send_no_longer_possible_across_ticks_with_updated_context(client):
-    cat = json.loads(
-        (DATASET / "categories" / "dentists.json").read_text()
-    )
+    cat = json.load(open("../dataset/categories/dentists.json"))
     client.post("/v1/context", json={"scope": "category", "context_id": "dentists", "version": 1, "payload": cat, "delivered_at": "2026-04-26T10:00:00Z"})
-    merchants = json.loads(
-        (DATASET / "merchants_seed.json").read_text()
-    )["merchants"]
+    merchants = json.load(open("../dataset/merchants_seed.json"))["merchants"]
     m = dict(merchants[0])
     m["performance"]["delta_7d"]["calls_pct"] = -0.30
     client.post("/v1/context", json={"scope": "merchant", "context_id": m["merchant_id"], "version": 1, "payload": m, "delivered_at": "2026-04-26T10:00:00Z"})
@@ -228,18 +221,12 @@ def test_release_unblocks_a_reservation_that_was_never_actually_sent():
 def test_concurrent_tick_calls_for_the_same_trigger_never_double_send(client):
     import threading
 
-    cat = json.loads(
-        (DATASET / "categories" / "dentists.json").read_text()
-    )
+    cat = json.load(open("../dataset/categories/dentists.json"))
     client.post("/v1/context", json={"scope": "category", "context_id": "dentists", "version": 1, "payload": cat, "delivered_at": "2026-04-26T10:00:00Z"})
-    merchants = json.loads(
-        (DATASET / "merchants_seed.json").read_text()
-    )["merchants"]
+    merchants = json.load(open("../dataset/merchants_seed.json"))["merchants"]
     m = merchants[0]
     client.post("/v1/context", json={"scope": "merchant", "context_id": m["merchant_id"], "version": 1, "payload": m, "delivered_at": "2026-04-26T10:00:00Z"})
-    triggers = json.loads(
-        (DATASET / "triggers_seed.json").read_text()
-    )["triggers"]
+    triggers = json.load(open("../dataset/triggers_seed.json"))["triggers"]
     t = [x for x in triggers if x["id"] == "trg_001_research_digest_dentists"][0]
     client.post("/v1/context", json={"scope": "trigger", "context_id": t["id"], "version": 1, "payload": t, "delivered_at": "2026-04-26T10:00:00Z"})
 
