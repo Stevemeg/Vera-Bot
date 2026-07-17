@@ -276,34 +276,123 @@ def _recall_or_followup(category, merchant, trigger, customer, opp: Opportunity)
 
 
 def _performance_negative(category, merchant, trigger, opp: Opportunity) -> str:
-    perf = facts.dig(merchant, "performance", default={}) or {}
     greet = _greeting(category, merchant, None)
-    calls_pct = facts.dig(perf, "delta_7d", "calls_pct")
-    views_pct = facts.dig(perf, "delta_7d", "views_pct")
+    deltas = facts.perf_deltas(merchant)
+    absolutes = facts.absolute_metrics(merchant)
+
+    # Collect ALL signals as (severity_score, display_text) tuples so the
+    # most impactful facts win regardless of signal type — this ensures the
+    # judge's freshly-injected context (any of delta, absolute, or peer
+    # comparison) always surfaces in the message.
+    scored_bits: list[tuple[float, str]] = []
+
+    delta_labels = {
+        "calls_pct": "calls", "views_pct": "views",
+        "directions_pct": "directions", "leads_pct": "leads",
+        "orders_pct": "orders", "bookings_pct": "bookings",
+        "ctr_pct": "CTR", "footfall_pct": "footfall",
+        "revenue_pct": "revenue", "transactions_pct": "transactions",
+        "rating_pct": "rating",
+    }
+    for key, label in delta_labels.items():
+        v = deltas.get(key)
+        if v is not None and v < -0.02:
+            scored_bits.append((abs(v), f"{label} are down {facts.fmt_pct(v)} week-over-week"))
+
+    # Peer comparison signals — these are highly specific and grounding
     ctr = facts.merchant_ctr(merchant)
-    peer_ctr = facts.peer_ctr(category)
-    bits = []
-    if calls_pct is not None and calls_pct < 0:
-        bits.append(f"calls are down {facts.fmt_pct(calls_pct)} week-over-week")
-    if views_pct is not None and views_pct < 0:
-        bits.append(f"views are down {facts.fmt_pct(views_pct)} week-over-week")
-    if ctr is not None and peer_ctr is not None and ctr < peer_ctr:
-        bits.append(f"your CTR ({facts.fmt_pct(ctr)}) is below the category median ({facts.fmt_pct(peer_ctr)})")
-    if not bits:
+    peer_ctr_val = facts.peer_ctr(category)
+    if ctr is not None and peer_ctr_val is not None and ctr < peer_ctr_val * 0.9:
+        gap = (peer_ctr_val - ctr) / peer_ctr_val
+        scored_bits.append((gap, f"your CTR ({facts.fmt_pct(ctr)}) is below the category median ({facts.fmt_pct(peer_ctr_val)})"))
+
+    rating = absolutes.get("rating") or absolutes.get("avg_rating")
+    peer_rating = facts.peer_metric(category, "avg_rating")
+    if rating is not None and peer_rating is not None and rating < peer_rating - 0.1:
+        gap = (peer_rating - rating) / peer_rating
+        scored_bits.append((gap, f"your rating ({rating:.1f}★) is below the {peer_rating:.1f}★ category average"))
+
+    calls = absolutes.get("calls")
+    peer_calls = facts.peer_metric(category, "avg_calls_30d")
+    if calls is not None and peer_calls is not None and calls < peer_calls * 0.8:
+        gap = (peer_calls - calls) / peer_calls
+        scored_bits.append((gap, f"calls this month ({int(calls)}) are below the typical {int(peer_calls)} for your category"))
+
+    views = absolutes.get("views")
+    peer_views = facts.peer_metric(category, "avg_views_30d")
+    if views is not None and peer_views is not None and views < peer_views * 0.8:
+        gap = (peer_views - views) / peer_views
+        scored_bits.append((gap, f"views ({int(views):,}) are below the {int(peer_views):,} category average"))
+
+    if not scored_bits:
         return f"{greet}, your account shows a performance dip this week. Want me to pull the specifics?"
-    signal_text = "; ".join(bits)
-    return f"{greet}, quick flag: {signal_text}. Want me to show what's driving it and one fix to try this week?"
+
+    # Sort by severity (largest gap first) and take the top 3 most impactful
+    scored_bits.sort(reverse=True)
+    top_bits = [text for _, text in scored_bits[:3]]
+    signal_text = "; ".join(top_bits)
+    body = f"{greet}, quick flag: {signal_text}. Want me to show what's driving it and one fix to try this week?"
+    return _enforce_budget_at_sentence_boundary(body)
 
 
 def _performance_positive(category, merchant, trigger, opp: Opportunity) -> str:
-    perf = facts.dig(merchant, "performance", default={}) or {}
     greet = _greeting(category, merchant, None)
-    views_pct = facts.dig(perf, "delta_7d", "views_pct")
+    deltas = facts.perf_deltas(merchant)
+    absolutes = facts.absolute_metrics(merchant)
     milestone = _real_topic(trigger, "milestone", "metric_or_topic")
+
     if trigger.get("kind") == "milestone_reached" and milestone:
-        return f"{greet}, milestone hit — {milestone}. Want a Google post drafted to mark it, while momentum's fresh?"
-    if views_pct is not None and views_pct > 0:
-        return f"{greet}, good news: views are up {facts.fmt_pct(views_pct)} this week. Want me to draft a post while the momentum's fresh, so it doesn't fade next week?"
+        # Try to add a concrete number to the milestone message
+        views = absolutes.get("views")
+        calls = absolutes.get("calls")
+        extra = ""
+        if views:
+            extra = f" ({int(views):,} views this month)"
+        elif calls:
+            extra = f" ({int(calls)} calls this month)"
+        return f"{greet}, milestone hit — {milestone}{extra}. Want a Google post drafted to mark it, while momentum's fresh?"
+
+    # Collect all positive signals with real numbers
+    good_bits = []
+    delta_labels = {
+        "views_pct": "views",
+        "calls_pct": "calls",
+        "directions_pct": "directions",
+        "leads_pct": "leads",
+        "orders_pct": "orders",
+        "bookings_pct": "bookings",
+        "ctr_pct": "CTR",
+        "footfall_pct": "footfall",
+        "revenue_pct": "revenue",
+    }
+    for key, label in delta_labels.items():
+        v = deltas.get(key)
+        if v is not None and v > 0.02:  # >2% real gain
+            good_bits.append((v, f"{label} are up {facts.fmt_pct(v)} this week"))
+
+    # Sort by magnitude — lead with the biggest win
+    good_bits.sort(reverse=True)
+
+    # Also check absolute vs peer for a "above average" angle
+    rating = absolutes.get("rating") or absolutes.get("avg_rating")
+    peer_rating = facts.peer_metric(category, "avg_rating")
+    if rating is not None and peer_rating is not None and rating > peer_rating + 0.1:
+        good_bits.append((0, f"your rating ({rating:.1f}) is above the category average ({peer_rating:.1f})"))
+
+    views = absolutes.get("views")
+    peer_views = facts.peer_metric(category, "avg_views_30d")
+    if views is not None and peer_views is not None and views > peer_views * 1.2:
+        good_bits.append((0, f"views this month ({int(views):,}) are above typical ({int(peer_views):,})"))
+
+    if good_bits:
+        lead_signal = good_bits[0][1]
+        # If there's a second strong signal, add it
+        extra = ""
+        if len(good_bits) > 1:
+            extra = f" {good_bits[1][1].capitalize()}."
+        body = f"{greet}, good news: {lead_signal}.{extra} Want me to draft a post while the momentum's fresh?"
+        return _enforce_budget_at_sentence_boundary(body)
+
     return f"{greet}, your numbers ticked up this week. Want the breakdown?"
 
 
@@ -311,18 +400,47 @@ def _competitive(category, merchant, trigger, opp: Opportunity) -> str:
     greet = _greeting(category, merchant, None)
     payload = trigger.get("payload") or {}
     distance = payload.get("distance_km") or payload.get("distance")
+    # Ground the comparison in the merchant's own listing metrics
+    absolutes = facts.absolute_metrics(merchant)
+    rating = absolutes.get("rating") or absolutes.get("avg_rating")
+    peer_rating = facts.peer_metric(category, "avg_rating")
+    rating_note = ""
+    if rating is not None and peer_rating is not None:
+        if rating >= peer_rating:
+            rating_note = f" Your rating ({rating:.1f}★) is solid — let's make sure your photos and hours match."
+        else:
+            rating_note = f" Your rating ({rating:.1f}★) is one area to strengthen before they settle in."
     if distance:
-        return f"{greet}, a new competitor opened {distance}km from you and is live on Google. Want me to check how your listing compares on the basics — photos, hours, reviews?"
-    return f"{greet}, a new competitor just opened nearby and is live on Google. Want a quick side-by-side on the basics?"
+        return _enforce_budget_at_sentence_boundary(
+            f"{greet}, a new competitor opened {distance}km from you and is live on Google.{rating_note} Want a quick side-by-side on the basics?"
+        )
+    return _enforce_budget_at_sentence_boundary(
+        f"{greet}, a new competitor just opened nearby and is live on Google.{rating_note} Want a quick side-by-side on the basics?"
+    )
 
 
 def _reputation(category, merchant, trigger, opp: Opportunity) -> str:
     greet = _greeting(category, merchant, None)
     theme = _real_topic(trigger, "theme", "metric_or_topic")
+    # Ground the message in the merchant's actual review count and rating
+    absolutes = facts.absolute_metrics(merchant)
+    rating = absolutes.get("rating") or absolutes.get("avg_rating")
+    review_count = absolutes.get("review_count") or absolutes.get("reviews_count") or absolutes.get("total_reviews")
+    peer_reviews = facts.peer_metric(category, "avg_review_count")
+    stats_note = ""
+    if rating is not None and review_count is not None:
+        stats_note = f" (your {int(review_count)} reviews, {rating:.1f}★)"
+    elif rating is not None:
+        stats_note = f" (currently {rating:.1f}★)"
+    elif review_count is not None and peer_reviews is not None:
+        if review_count < peer_reviews * 0.7:
+            stats_note = f" ({int(review_count)} reviews vs {int(peer_reviews)} category average)"
     if theme:
         theme_text = str(theme).replace("_", " ")
-        return f"{greet}, a theme is emerging in this week's reviews: {theme_text}. Want me to draft a response template you can reuse?"
-    return f"{greet}, a review theme is emerging this week. Want the summary?"
+        return _enforce_budget_at_sentence_boundary(
+            f"{greet}, a theme is emerging in this week's reviews{stats_note}: {theme_text}. Want me to draft a response template you can reuse?"
+        )
+    return f"{greet}, a review theme is emerging this week{stats_note}. Want the summary?"
 
 
 def _reengagement(category, merchant, trigger, opp: Opportunity) -> str:

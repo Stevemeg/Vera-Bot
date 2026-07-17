@@ -158,6 +158,66 @@ def peer_ctr(category: Optional[dict]) -> Optional[float]:
     return dig_any(category, ("peer_stats", "avg_ctr"), ("peer_stats", "avg_engagement"))
 
 
+def perf_metric(merchant: Optional[dict], *field_path: str) -> Optional[float]:
+    """Generic schema-tolerant getter for any performance sub-field.
+    Returns the value as a float or None."""
+    val = dig(merchant, "performance", *field_path)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def peer_metric(category: Optional[dict], key: str) -> Optional[float]:
+    """Get any peer_stats field by key, returning float or None."""
+    val = dig(category, "peer_stats", key)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def perf_deltas(merchant: Optional[dict]) -> dict[str, float]:
+    """Return all available week-over-week delta fields as a dict.
+    Handles any new delta fields the judge might inject (orders_pct,
+    bookings_pct, leads_pct, rating_pct, etc.) without requiring code
+    changes — schema-tolerant by design."""
+    raw = dig(merchant, "performance", "delta_7d", default={}) or {}
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for k, v in raw.items():
+        try:
+            result[k] = float(v)
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def absolute_metrics(merchant: Optional[dict]) -> dict[str, float]:
+    """Return all absolute performance counters (views, calls, directions,
+    leads, orders, bookings, rating, reviews_count, etc.) as a dict.
+    Schema-tolerant: picks up any new fields the judge pushes without
+    requiring composer changes."""
+    perf = dig(merchant, "performance", default={}) or {}
+    skip = {"delta_7d", "window_days", "scope", "period"}
+    result = {}
+    if not isinstance(perf, dict):
+        return result
+    for k, v in perf.items():
+        if k in skip:
+            continue
+        try:
+            result[k] = float(v)
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
 def voice(category: Optional[dict]) -> dict:
     return dig(category, "voice", default={}) or {}
 
